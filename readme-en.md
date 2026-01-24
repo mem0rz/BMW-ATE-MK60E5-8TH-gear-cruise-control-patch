@@ -1,4 +1,5 @@
 At your own risk!At your own risk!At your own risk!At your own risk!At your own risk!At your own risk!
+This modification is a security-level change, and you assume full responsibility for it. The project bears no liability whatsoever. Any consequences arising from the use of this project shall be borne solely by the user.
 
 Fix a DSC firmware issue where  cruise control drops out in 8th gear, and reduce/avoid the related  ISTA history DTC 5E62, while keeping changes minimal and low-risk (especially preserving brake/cancel safety exits). 
 1) Firmware Loading (confirmed) 
