@@ -2,75 +2,72 @@ At your own risk!At your own risk!At your own risk!At your own risk!At your own 
 This modification is a security-level change, and you assume full responsibility for it. The project bears no liability whatsoever. Any consequences arising from the use of this project shall be borne solely by the user.
 
 Fix a DSC firmware issue where  cruise control drops out in 8th gear, and reduce/avoid the related  ISTA history DTC 5E62, while keeping changes minimal and low-risk (especially preserving brake/cancel safety exits). 
-1) Firmware Loading (confirmed) 
+1) Source: EGS CAN message 0x1D2 (“TransmissionDataDisplay”)
 
-    Image file:  6862873A111.bin (16 MB), but valid ROM image starts at  file offset 0x3AC. 
-    ROM mapping: 
-        ROM base  0x00400000, ROM size  0x00100000
-    Verified address conversion: 
-        file_off = (EA - 0x00400000) + 0x3AC
-    IDA settings: PPC/MPC55xx, Big Endian, VLE enabled. 
+A community DBC indicates CAN ID 0x1D2 (decimal 466) is an EGS message carrying gear display/gear-related fields. In the DSC image we found a VM path strongly tied to a “context” handle 0x0078 and a signal handle 0x7CE0.
+1.1 Direct decode / landing into slot0C
 
-2) Key Discovery: Most DSC logic is a 16‑bit Token VM (script/bytecode) 
+In the VM block starting at 0x4541AC:
 
-Instead of native PPC instructions, large parts are a structured 16‑bit token stream: 
+    25F0 0078 selects a CAN/context buffer (context handle 0x0078).
+    25F0 7CE0 selects a specific signal (signal handle 0x7CE0).
+    Immediately after, the same current value is stored twice:
+        9720 then 970C
 
-    A7xx: read slot/variable 
-    B7xx: case/compare branch on the last-read value 
-    00CF: end/return marker 
-    25F0 xxxx: strongly correlated with CAN/context-driven signal extraction 
+This pattern (9720 970C back-to-back) appears only once in the entire ROM, and within the discovered 0x1D2 chain this is the only 970C store. That makes it the strongest candidate for “gear(ish) signal → slot0C” landing.
 
-Analysis therefore focuses on token flow segmentation, branch paths, and slot read/write chains. 
-3) Root Symptom in Cruise Logic:  slot0C == 0x0B causes immediate exit 
+Empirically, in driving conditions where “8th gear causes cruise to drop”, the internal value being compared later is 0x0B, which matches a common “PRND + forward gear” enumeration scheme (e.g., 7th=0x0A, 8th=0x0B, 9th=0x0C).
+2) Cruise logic: slot0C==0x0B triggers an immediate exit
 
-In the cruise-related VM block ( 0x004DA3AC): 
+In the cruise-related VM block (0x4DA3AC), the code reads slot0C and uses a case/branch:
 
-    A70C reads  slot[0x0C]
-    B70B is followed by a short  FAST_EXIT sequence ( ... 21F0 00CF), i.e., immediate return. 
-    The cruise switch compares only  0x0B and  0x0C (not a “>=8 gears” range check). 
+    A70C read slot0C
+    B70B case value 0x0B → executes a short “return/terminate” sequence (… 21F0 00CF), i.e. a fast exit.
+    B70C case value 0x0C → follows a different path (not the fast-exit block).
 
-A global “last A7 == 0x0C” filter reduced noise and confirmed only a small number of true  slot0C==0x0B comparisons across the ROM, with cruise being the only one that exits immediately. 
-4) Upstream Source:  slot0C comes from transmission/CAN context and is re-processed 
+So the cruise dropout is not a “>=8” range check; it is an exact match on slot0C == 0x0B.
 
-A unique signature located the main landing point for  slot0C: 
+A global scan confirms there are only 6 places in the ROM where slot0C is actually the active compare value and the case value is 0x0B. Only the cruise block uses that compare to do an immediate early return.
+3) There is additional processing (ctx=0x0079) that gates slot0C updates
 
-    Only one place contains the pattern  9720; 970C (same value stored into two slots), at  0x4541BC. 
-    Immediately before it, the VM executes: 
-        25F0 0078
-        25F0 7CE0
-        then stores to  slot20 and  slot0C
-        This indicates a context/signal extraction step feeding the value. 
+Besides the direct landing above, there is a separate VM block under context 0x0079 (starting 0x492A96) that conditionally updates slot0C (and also writes slot0B):
 
-Further investigation showed  multiple writers to  slot0C (not just the raw decode path), including a  ctx=0079 “sanitizing/gating” path ( 0x492A96) that conditionally skips writing  slot0C/ slot0B based on threshold checks (e.g.,  8C0B plus conditional jumps). This supports the idea that 0x0B is treated as a boundary/unsupported code in some flows. 
-5) ISTA DTC Link: 5E62 is mapped to internal monitor ID 0x202A and that monitor uses 0x0B as a boundary 
+    It contains two independent “fail → skip stores → return” gates:
+        Gate 1 uses 7D1C plus an explicit threshold constant 8C0B, then branches via E047 to a return path. This branch skips the 970C and 970B stores.
+        Gate 2 uses 7C8F and branches via E020 to another return path, also skipping the stores.
 
-    A diagnostic mapping table in ROM contains: 
-        202A → 5E62
-    Non-table uses of  202A were found at only a few locations. 
-    In the  ctx=0079 monitor block containing  202A ( 0x4C59C8..0x4C5BD2), explicit boundary tokens appear: 
-        A90B and  B90B (clear “0x0B boundary” indicators) 
-        This provides a static explanation for “8th gear triggers a history DTC”: 0x0B is not only a cruise-exit code path, it is also referenced as a diagnostic boundary in a monitor that maps to 5E62. 
+When both gates pass, the block performs:
 
-6) Patch Design (minimal, no new cases inserted) 
-Principles 
+    970C (write slot0C)
+    970B (write slot0B)
 
-    Avoid inserting new VM cases/tokens (high risk). 
-    Prefer changing existing 16-bit constants/tokens (low-risk, reversible). 
-    Address both: (a) the DTC boundary and (b) cruise drop-out behavior. 
+This is not a simple decode; it is a validation/normalization path. The presence of the explicit 0x0B threshold (8C0B) suggests the firmware treats the 0x0B boundary as special in this path as well (consistent with “7-gear expectation” vs “8-gear reality”).
+4) DTC 5E62 is tied to monitor ID 0x202A, and monitor logic uses a 0x0B threshold
 
-Patch set 
+A DTC/monitor mapping table is present at 0x4E7080 with entries like:
 
-     DTC 202A / 5E62 boundary shift
+    202A 5E62 ...
+
+So DTC 5E62 corresponds to internal monitor ID 0x202A.
+
+We found only three non-table uses of 0x202A, and one of them is a ctx=0x0079 block at 0x4C59C8..0x4C5BD2 which contains:
+
+    25F0 0079 (ctx select)
+    202A (monitor ID)
+    explicit A90B and B90B compare/threshold tokens
+
+That provides a plausible explanation for the field observation: when “8th gear” is present (encoded as 0x0B), the DSC not only drops cruise (slot0C==0x0B fast exit), but also has a monitor that treats 0x0B as a boundary and can log 5E62 as a history fault.
+5) Patch approach used (minimal edits, no new cases)
+
+Two patches were selected to avoid restructuring VM code:
+
+     Suppress the 5E62-trigger boundary at 0x0B in the monitor block (ctx=0x0079, monitor 0x202A):
 
     A90B → A90C
     B90B → B90C
-    This moves the monitor’s “0x0B boundary” to 0x0C, reducing the chance that 8th gear (often encoded as 0x0B) triggers the monitor. 
 
-     Cruise behavior fix (swap cases)
+     Prevent cruise from immediately exiting on slot0C==0x0B without adding new cases:
 
-    Swap  B70B and  B70C in the cruise switch: 
+    swap the cruise cases by changing the two tokens:
         B70C → B70B
         B70B → B70C
-        This prevents  slot0C==0x0B from taking the FAST_EXIT branch, without adding new cases. 
-
-Patches were implemented at the Intel HEX ( .0pa) level for WinkFP flashing, with automatic recomputation of Intel HEX line checksums. 
